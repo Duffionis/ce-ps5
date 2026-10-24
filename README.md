@@ -7,7 +7,9 @@ Le fondamenta di un emulatore PS5/PS4 scritto in **Ce++** (https://github.com/Du
 - `src/elf.ce`: parser e caricatore ELF64 x86-64, con controlli su ogni lettura (un file corrotto da' un errore, mai un crash):
   segmenti, mappatura, rilocazioni `RELATIVE`, permessi di pagina.
 - `src/sistema.ce`: intercetta le `syscall` del programma ospite con *syscall user dispatch* di Linux (kernel >= 5.11) e le serve in Ce++,
-  con la convenzione FreeBSD di PS4/PS5 (numero in rax; argomenti in rdi, rsi, rdx, r10, r8, r9). Per ora: `exit`, `write`, `getpid`, il resto da' ENOSYS.
+  con la convenzione FreeBSD di PS4/PS5 (numero in rax; argomenti in rdi, rsi, rdx, r10, r8, r9). Per ora: `exit`, `read`, `write`, `open` (flag tradotti), `close`, `getpid`, `mmap` (flag tradotti), `munmap`, `mprotect`, `lseek`,
+  `clock_gettime`, `nanosleep`, `sysarch` (base di FS = TLS del guest), il resto da' ENOSYS. Gli errori seguono la convenzione BSD (CF=1, rax=errno).
+  Un piccolo stub in linguaggio macchina scambia il registro FS fra guest e ospite a ogni syscall, cosi' il TLS del guest non rovina quello di libc.
 - `prog/`: programmi di prova scritti in assembly (sorgente `.asm` e `.elf` pronto).
 
 ## Uso

@@ -1,23 +1,33 @@
 // Intercetta le chiamate di sistema del programma ospite (con "syscall user dispatch" di Linux) e le serve noi.
-// Il guest usa la convenzione FreeBSD (come PS4/PS5): numero in rax, argomenti in rdi, rsi, rdx, r10, r8, r9.
+// Il guest usa la convenzione FreeBSD (come PS4/PS5): numero in rax, argomenti in rdi, rsi, rdx, r10, r8, r9;
+// in uscita rax = risultato e il flag CF segnala l'errore (rax = errno).
+esterna funzione munmap(a: *byte, lunghezza: dimensione) -> intero;
 esterna funzione prctl(opzione: intero, a: naturale64, b: naturale64, c: naturale64, d: naturale64) -> intero;
-esterna funzione sigaction(sig: intero, nuova: *byte, vecchia: *byte) -> intero;
 esterna funzione write(fd: intero, dati: *byte, n: dimensione) -> lungo;
+esterna funzione read(fd: intero, dati: *byte, n: dimensione) -> lungo;
+esterna funzione open(percorso: *byte, flag: intero, modo: intero) -> intero;
+esterna funzione close(fd: intero) -> intero;
+esterna funzione lseek(fd: intero, off: lungo, da: intero) -> lungo;
+esterna funzione clock_gettime(id: intero, ts: *byte) -> intero;
+esterna funzione nanosleep(richiesta: *byte, resto: *byte) -> intero;
+esterna funzione __errno_location() -> *byte;
 esterna funzione _exit(codice: intero);
 esterna funzione syscall(n: lungo, a: lungo, b: lungo, c: lungo, d: lungo) -> lungo;
 
 variabile selettore: [byte; 8];        // selettore[0]: 0 = syscall permesse, 1 = intercettate
-variabile gestore_pronto: booleano;
 variabile ultima_syscall: naturale64;
 variabile conteggio_syscall: naturale64;
+variabile stub: naturale64;           // indirizzo della pagina col codice macchina: restorer, trampolino (cambia FS), cella guest_fs
 
 // posizioni dei registri dentro l'ucontext_t di Linux x86-64
 costante R_R8: dimensione = 40;
+costante R_R9: dimensione = 48;
 costante R_R10: dimensione = 56;
 costante R_RDI: dimensione = 104;
 costante R_RSI: dimensione = 112;
 costante R_RDX: dimensione = 136;
 costante R_RAX: dimensione = 144;
+costante R_EFL: dimensione = 176;
 
 funzione registro(ctx: *byte, o: dimensione) -> naturale64 {
     rischio { ritorna *((ctx + o) come *naturale64); }
@@ -27,38 +37,91 @@ funzione imposta_registro(ctx: *byte, o: dimensione, v: naturale64) {
     rischio { *((ctx + o) come *naturale64) = v; }
 }
 
+funzione ok(ctx: *byte, v: naturale64) {
+    imposta_registro(ctx, R_RAX, v);
+    imposta_registro(ctx, R_EFL, registro(ctx, R_EFL) & 18446744073709551614);   // CF = 0
+}
+
+funzione errore(ctx: *byte, codice: naturale64) {
+    imposta_registro(ctx, R_RAX, codice);
+    imposta_registro(ctx, R_EFL, registro(ctx, R_EFL) | 1);                      // CF = 1
+}
+
+funzione errno_host() -> naturale64 {
+    rischio { ritorna (*(__errno_location() come *intero)) come naturale64; }
+}
+
+// il risultato di una funzione C che ritorna -1 in caso di errore
+funzione esito(ctx: *byte, r: lungo) {
+    se r < 0 { errore(ctx, errno_host()); } altrimenti { ok(ctx, r come naturale64); }
+}
+
+funzione cella_fs() -> *byte {
+    rischio { ritorna (stub + 256) come *byte; }
+}
+
+funzione converti_open(f: naturale64) -> intero {
+    // FreeBSD -> Linux: O_CREAT 0x200 -> 0x40, O_TRUNC 0x400 -> 0x200, O_APPEND 8 -> 0x400, O_EXCL 0x800 -> 0x80
+    variabile l: intero = (f & 3) come intero;
+    se (f & 512) != 0 { l = l | 64; }
+    se (f & 1024) != 0 { l = l | 512; }
+    se (f & 8) != 0 { l = l | 1024; }
+    se (f & 2048) != 0 { l = l | 128; }
+    ritorna l;
+}
+
 // i servizi (numeri FreeBSD)
 funzione servi(ctx: *byte) {
     costante n: naturale64 = registro(ctx, R_RAX);
+    costante a1: naturale64 = registro(ctx, R_RDI);
+    costante a2: naturale64 = registro(ctx, R_RSI);
+    costante a3: naturale64 = registro(ctx, R_RDX);
+    costante a4: naturale64 = registro(ctx, R_R10);
+    costante a5: naturale64 = registro(ctx, R_R8);
+    costante a6: naturale64 = registro(ctx, R_R9);
     ultima_syscall = n;
     conteggio_syscall += 1;
-    scegli n {
-        caso 1 {   // exit(codice)
-            costante codice: naturale64 = registro(ctx, R_RDI);
-            rischio { selettore[0] = 0; _exit(codice come intero); }
-        }
-        caso 4 {   // write(fd, buf, n)
-            costante fd: naturale64 = registro(ctx, R_RDI);
-            costante buf: naturale64 = registro(ctx, R_RSI);
-            costante lung: naturale64 = registro(ctx, R_RDX);
-            variabile fatti: lungo = 0;
-            rischio {
-                selettore[0] = 0;
-                fatti = write(fd come intero, buf come *byte, lung come dimensione);
-                selettore[0] = 1;
+    rischio {
+        scegli n {
+            caso 1 { _exit(a1 come intero); }
+            caso 3 { esito(ctx, read(a1 come intero, a2 come *byte, a3 come dimensione)); }
+            caso 4 { esito(ctx, write(a1 come intero, a2 come *byte, a3 come dimensione)); }
+            caso 5 { esito(ctx, open(a1 come *byte, converti_open(a2), a3 come intero) come lungo); }
+            caso 6 { esito(ctx, close(a1 come intero) come lungo); }
+            caso 20 { ok(ctx, 1000); }
+            caso 73 { esito(ctx, munmap(a1 come *byte, a2 come dimensione) come lungo); }
+            caso 74 { esito(ctx, mprotect(a1 come *byte, a2 come dimensione, a3 come intero) come lungo); }
+            caso 165 {   // sysarch(op, arg): 129 = imposta la base di FS (il TLS del guest), 130 = la legge
+                se a1 == 129 {
+                    *((cella_fs()) come *naturale64) = *(a2 come *naturale64);
+                    ok(ctx, 0);
+                } altrimenti se a1 == 130 {
+                    *(a2 come *naturale64) = *((cella_fs()) come *naturale64);
+                    ok(ctx, 0);
+                } altrimenti { errore(ctx, 22); }
             }
-            imposta_registro(ctx, R_RAX, fatti come naturale64);
-        }
-        caso 20 { imposta_registro(ctx, R_RAX, 1000); }   // getpid
-        altrimenti {
-            // sconosciuta: errore ENOSYS (78 in FreeBSD)
-            imposta_registro(ctx, R_RAX, 78);
+            caso 232 {   // clock_gettime: CLOCK_MONOTONIC di FreeBSD e' 4, su Linux 1
+                variabile id: intero = 0;
+                se a1 == 4 { id = 1; }
+                esito(ctx, clock_gettime(id, a2 come *byte) come lungo);
+            }
+            caso 240 { esito(ctx, nanosleep(a1 come *byte, a2 come *byte) come lungo); }
+            caso 477 {   // mmap: MAP_ANON di FreeBSD (0x1000) -> 0x20 di Linux
+                variabile fl: intero = (a4 & 19) come intero;
+                se (a4 & 4096) != 0 { fl = fl | 32; }
+                costante p: *byte = mmap(a1 come *byte, a2 come dimensione, a3 come intero, fl, a5 come intero, a6 come lungo);
+                se (p come naturale64) == 18446744073709551615 { errore(ctx, errno_host()); } altrimenti { ok(ctx, p come naturale64); }
+            }
+            caso 478 { esito(ctx, lseek(a1 come intero, a2 come lungo, a3 come intero)); }
+            altrimenti { errore(ctx, 78); }   // ENOSYS
         }
     }
 }
 
 funzione gestore(sig: intero, info: *byte, ctx: *byte) {
+    selettore[0] = 0;      // dentro il gestore le syscall dell'ospite (libc) sono permesse
     servi(ctx);
+    selettore[0] = 1;      // e il guest torna sotto sorveglianza
 }
 
 funzione scrivi64(p: *byte, o: dimensione, v: naturale64) {
@@ -66,29 +129,34 @@ funzione scrivi64(p: *byte, o: dimensione, v: naturale64) {
 }
 
 // installa il gestore SIGSYS e le "syscall user dispatch": da qui in poi, quando selettore[0] == 1,
-// ogni 'syscall' eseguita fuori dalla pagina del restorer arriva a 'gestore'.
+// ogni 'syscall' eseguita fuori dalla pagina dello stub arriva a 'gestore'. Lo stub scambia FS (TLS del guest <-> dell'ospite).
 funzione prepara() -> booleano {
-    variabile pagina: *byte;
+    costante codice: [byte; 128] = [184, 15, 0, 0, 0, 15, 5, 204, 204, 204, 204, 204, 204, 204, 204, 204, 243, 72, 15, 174, 192, 195, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 83, 243, 72, 15, 174, 192, 72, 137, 5, 211, 0, 0, 0, 72, 139, 5, 212, 0, 0, 0, 243, 72, 15, 174, 208, 255, 21, 209, 0, 0, 0, 72, 139, 5, 186, 0, 0, 0, 243, 72, 15, 174, 208, 91, 195, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204];
+    variabile pagina_stub: *byte;
     rischio {
-        pagina = mmap((0 come dimensione) come *byte, 4096, 7, 34, -1, 0);
-        // restorer: mov eax,15 ; syscall   (rt_sigreturn)
-        *pagina = 0xB8; *(pagina + 1) = 15; *(pagina + 2) = 0; *(pagina + 3) = 0; *(pagina + 4) = 0;
-        *(pagina + 5) = 0x0F; *(pagina + 6) = 0x05;
+        pagina_stub = mmap((0 come dimensione) come *byte, 4096, 7, 34, -1, 0);
+        per i in 0..128 { *(pagina_stub + i) = codice[i]; }
+        stub = pagina_stub come naturale64;
     }
-    variabile ksa: [byte; 32];
+    variabile leggi_fs: funzione() -> naturale64;
     variabile g: funzione(intero, *byte, *byte) = gestore;
-    variabile errore: lungo = 0;
+    rischio { leggi_fs = (pagina_stub + 16) come funzione() -> naturale64; }
+    costante fs_ospite: naturale64 = leggi_fs();
+    scrivi64(pagina_stub, 264, fs_ospite);                                   // host_fs
+    rischio { scrivi64(pagina_stub, 272, (g come *byte) come naturale64); }  // handler_c
+    scrivi64(pagina_stub, 256, fs_ospite);                                   // guest_fs: all'inizio uguale
+    variabile ksa: [byte; 32];
+    variabile errore_sa: lungo = 0;
     rischio {
         costante k: *byte = &ksa[0];
-        scrivi64(k, 0, (g come *byte) come naturale64);
-        scrivi64(k, 8, 4 | 67108864);                       // SA_SIGINFO | SA_RESTORER
-        scrivi64(k, 16, (pagina come naturale64));
+        scrivi64(k, 0, ((pagina_stub + 32) come naturale64));               // il gestore e' il trampolino
+        scrivi64(k, 8, 4 | 67108864);                                        // SA_SIGINFO | SA_RESTORER
+        scrivi64(k, 16, (pagina_stub come naturale64));                      // restorer
         scrivi64(k, 24, 0);
-        errore = syscall(13, 31, (k come naturale64) come lungo, 0, 8);          // rt_sigaction(SIGSYS)
-        se errore != 0 { ritorna falso; }
+        errore_sa = syscall(13, 31, (k come naturale64) come lungo, 0, 8);   // rt_sigaction(SIGSYS)
+        se errore_sa != 0 { ritorna falso; }
         selettore[0] = 0;
-        se prctl(59, 1, pagina come naturale64, 4096, (&selettore[0]) come naturale64) != 0 { ritorna falso; }
+        se prctl(59, 1, pagina_stub come naturale64, 4096, (&selettore[0]) come naturale64) != 0 { ritorna falso; }
     }
-    gestore_pronto = vero;
     ritorna vero;
 }
