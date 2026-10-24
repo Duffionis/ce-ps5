@@ -12,9 +12,11 @@ esterna funzione clock_gettime(id: intero, ts: *byte) -> intero;
 esterna funzione nanosleep(richiesta: *byte, resto: *byte) -> intero;
 esterna funzione __errno_location() -> *byte;
 esterna funzione _exit(codice: intero);
+esterna funzione sched_yield() -> intero;
+esterna funzione pthread_create(t: *byte, attr: *byte, f: funzione(*byte) -> *byte, arg: *byte) -> intero;
 esterna funzione syscall(n: lungo, a: lungo, b: lungo, c: lungo, d: lungo) -> lungo;
 
-variabile selettore: [byte; 8];        // selettore[0]: 0 = syscall permesse, 1 = intercettate
+variabile prossimo_tid: naturale64 = 1001;
 variabile ultima_syscall: naturale64;
 variabile conteggio_syscall: naturale64;
 variabile stub: naturale64;           // indirizzo della pagina col codice macchina: restorer, trampolino (cambia FS), cella guest_fs
@@ -56,8 +58,36 @@ funzione esito(ctx: *byte, r: lungo) {
     se r < 0 { errore(ctx, errno_host()); } altrimenti { ok(ctx, r come naturale64); }
 }
 
-funzione cella_fs() -> *byte {
-    rischio { ritorna (stub + 256) come *byte; }
+// ---- funzioni scritte in linguaggio macchina nella pagina dello stub ----
+funzione chiama_stub0(scarto: dimensione) -> naturale64 {
+    variabile f: funzione() -> naturale64;
+    rischio { f = ((stub + (scarto come naturale64)) come *byte) come funzione() -> naturale64; }
+    ritorna f();
+}
+funzione leggi_fs() -> naturale64 { ritorna chiama_stub0(16); }
+funzione leggi_gs() -> naturale64 { ritorna chiama_stub0(32); }
+funzione imposta_gs(v: naturale64) {
+    variabile f: funzione(naturale64);
+    rischio { f = ((stub + 48) come *byte) come funzione(naturale64); }
+    f(v);
+}
+
+// Ogni thread ha un blocco di controllo, il cui indirizzo sta nel registro GS (il guest non lo usa):
+//   +0 FS dell'ospite (libc)   +8 FS del guest (TLS)   +16 selettore (1 = guest sotto sorveglianza)   +24 numero del thread
+funzione blocco() -> *byte {
+    rischio { ritorna leggi_gs() come *byte; }
+}
+
+funzione leggi_blocco64(o: dimensione) -> naturale64 {
+    rischio { ritorna *((blocco() + o) come *naturale64); }
+}
+
+funzione scrivi_blocco64(o: dimensione, v: naturale64) {
+    rischio { *((blocco() + o) come *naturale64) = v; }
+}
+
+funzione selettore(v: byte) {
+    rischio { *(blocco() + 16) = v; }
 }
 
 funzione converti_open(f: naturale64) -> intero {
@@ -89,14 +119,20 @@ funzione servi(ctx: *byte) {
             caso 5 { esito(ctx, open(a1 come *byte, converti_open(a2), a3 come intero) come lungo); }
             caso 6 { esito(ctx, close(a1 come intero) come lungo); }
             caso 20 { ok(ctx, 1000); }
+            caso 331 { sched_yield(); ok(ctx, 0); }
+            caso 340 { ok(ctx, 0); }   // sigprocmask: ignorata
+            caso 431 { esci_thread(a1); }
+            caso 432 { *(a1 come *naturale64) = leggi_blocco64(24); ok(ctx, 0); }
+            caso 454 { umtx(ctx, a1, a2, a3, a4); }
+            caso 455 { crea_thread(ctx, a1); }
             caso 73 { esito(ctx, munmap(a1 come *byte, a2 come dimensione) come lungo); }
             caso 74 { esito(ctx, mprotect(a1 come *byte, a2 come dimensione, a3 come intero) come lungo); }
             caso 165 {   // sysarch(op, arg): 129 = imposta la base di FS (il TLS del guest), 130 = la legge
                 se a1 == 129 {
-                    *((cella_fs()) come *naturale64) = *(a2 come *naturale64);
+                    scrivi_blocco64(8, *(a2 come *naturale64));
                     ok(ctx, 0);
                 } altrimenti se a1 == 130 {
-                    *(a2 come *naturale64) = *((cella_fs()) come *naturale64);
+                    *(a2 come *naturale64) = leggi_blocco64(8);
                     ok(ctx, 0);
                 } altrimenti { errore(ctx, 22); }
             }
@@ -118,45 +154,128 @@ funzione servi(ctx: *byte) {
     }
 }
 
+// ---- thread del guest ----
+// Il guest chiede un thread (thr_new): ne creiamo uno vero, che parte con il TLS e lo stack scelti dal guest.
+funzione avvio_thread(arg: *byte) -> *byte {
+    costante info: *byte = arg;
+    rischio { imposta_gs(arg come naturale64); }
+    variabile avvia: funzione(naturale64, naturale64, naturale64, naturale64);
+    rischio {
+        costante inizio: naturale64 = *((info + 128) come *naturale64);
+        costante a: naturale64 = *((info + 136) come *naturale64);
+        costante cima: naturale64 = *((info + 144) come *naturale64);
+        costante tls: naturale64 = *((info + 152) come *naturale64);
+        costante tid_figlio: naturale64 = *((info + 160) come *naturale64);
+        scrivi_blocco64(0, leggi_fs());
+        scrivi_blocco64(8, tls);
+        se tid_figlio != 0 { *(tid_figlio come *naturale64) = leggi_blocco64(24); }
+        se prctl(59, 1, stub, 4096, (arg + 16) come naturale64) != 0 { ritorna arg; }
+        *((info + 168) come *naturale64) = 1;            // pronto: il genitore puo' tornare al guest
+        // il thread nasce dentro il gestore, dove SIGSYS e' bloccato: va sbloccato prima di far partire il guest
+        variabile maschera: [naturale64; 1];
+        maschera[0] = 1073741824;
+        syscall(14, 1, ((&maschera[0]) come naturale64) come lungo, 0, 8);                       // rt_sigprocmask(SIG_UNBLOCK)
+        avvia = ((stub + 144) come *byte) come funzione(naturale64, naturale64, naturale64, naturale64);
+        selettore(1);
+        avvia(inizio, a, cima, tls);
+    }
+    ritorna arg;
+}
+
+funzione crea_thread(ctx: *byte, p: naturale64) {
+    variabile b: *byte;
+    rischio {
+        b = mmap((0 come dimensione) come *byte, 4096, 3, 34, -1, 0);
+        costante par: *byte = p come *byte;
+        costante pid_tid: naturale64 = prossimo_tid;
+        prossimo_tid += 1;
+        *((b + 24) come *naturale64) = pid_tid;
+        *((b + 128) come *naturale64) = *(par come *naturale64);                           // start_func
+        *((b + 136) come *naturale64) = *((par + 8) come *naturale64);                     // arg
+        *((b + 144) come *naturale64) = *((par + 16) come *naturale64) + *((par + 24) come *naturale64);   // cima dello stack
+        *((b + 152) come *naturale64) = *((par + 32) come *naturale64);                    // tls_base
+        *((b + 160) come *naturale64) = *((par + 48) come *naturale64);                    // child_tid
+        costante parent_tid: naturale64 = *((par + 56) come *naturale64);
+        se parent_tid != 0 { *(parent_tid come *naturale64) = pid_tid; }
+    }
+    variabile id: [naturale64; 1];
+    variabile r: intero = 0;
+    rischio { r = pthread_create((&id[0]) come *byte, (0 come dimensione) come *byte, avvio_thread, b); }
+    se r != 0 { errore(ctx, 11); ritorna; }
+    // il nuovo thread eredita il selettore del genitore: finche' non ha il proprio, il genitore resta nel gestore
+    rischio { mentre *((b + 168) come *naturale64) == 0 { sched_yield(); } }
+    ok(ctx, 0);
+}
+
+funzione esci_thread(stato: naturale64) {
+    rischio {
+        se stato != 0 {
+            *(stato come *naturale64) = 1;
+            syscall(202, stato come lungo, 1, 2147483647, 0);    // FUTEX_WAKE
+        }
+        syscall(60, 0, 0, 0, 0);                                 // fine del solo thread
+    }
+}
+
+// _umtx_op: l'attesa/risveglio di FreeBSD, tradotta in futex di Linux
+funzione umtx(ctx: *byte, oggetto: naturale64, op: naturale64, valore: naturale64, tempo: naturale64) {
+    scegli op {
+        caso 2, 11, 15 {   // WAIT: dormi finche' *oggetto == valore
+            rischio {
+                se (*(oggetto come *naturale32)) == (valore come naturale32) {
+                    syscall(202, oggetto come lungo, 0, valore come lungo, 0);       // FUTEX_WAIT (puo' tornare presto: il chiamante ripete)
+                }
+            }
+            ok(ctx, 0);
+        }
+        caso 3, 16 {       // WAKE: sveglia 'valore' thread
+            variabile n: lungo = 0;
+            rischio { n = syscall(202, oggetto come lungo, 1, valore come lungo, 0); }
+            ok(ctx, 0);
+        }
+        altrimenti { errore(ctx, 78); }
+    }
+}
+
 funzione gestore(sig: intero, info: *byte, ctx: *byte) {
-    selettore[0] = 0;      // dentro il gestore le syscall dell'ospite (libc) sono permesse
+    selettore(0);      // dentro il gestore le syscall dell'ospite (libc) sono permesse
     servi(ctx);
-    selettore[0] = 1;      // e il guest torna sotto sorveglianza
+    selettore(1);      // e il guest torna sotto sorveglianza
 }
 
 funzione scrivi64(p: *byte, o: dimensione, v: naturale64) {
     rischio { *((p + o) come *naturale64) = v; }
 }
 
-// installa il gestore SIGSYS e le "syscall user dispatch": da qui in poi, quando selettore[0] == 1,
+// installa il gestore SIGSYS e le "syscall user dispatch": da qui in poi, quando il selettore del thread e' 1,
 // ogni 'syscall' eseguita fuori dalla pagina dello stub arriva a 'gestore'. Lo stub scambia FS (TLS del guest <-> dell'ospite).
 funzione prepara() -> booleano {
-    costante codice: [byte; 128] = [184, 15, 0, 0, 0, 15, 5, 204, 204, 204, 204, 204, 204, 204, 204, 204, 243, 72, 15, 174, 192, 195, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 83, 243, 72, 15, 174, 192, 72, 137, 5, 211, 0, 0, 0, 72, 139, 5, 212, 0, 0, 0, 243, 72, 15, 174, 208, 255, 21, 209, 0, 0, 0, 72, 139, 5, 186, 0, 0, 0, 243, 72, 15, 174, 208, 91, 195, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204];
+    costante codice: [byte; 264] = [184, 15, 0, 0, 0, 15, 5, 204, 204, 204, 204, 204, 204, 204, 204, 204, 243, 72, 15, 174, 192, 195, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 243, 72, 15, 174, 200, 195, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 243, 72, 15, 174, 223, 195, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 83, 243, 72, 15, 174, 195, 101, 72, 139, 4, 37, 0, 0, 0, 0, 243, 72, 15, 174, 208, 101, 72, 137, 28, 37, 8, 0, 0, 0, 255, 21, 157, 0, 0, 0, 101, 72, 139, 4, 37, 8, 0, 0, 0, 243, 72, 15, 174, 208, 91, 195, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 243, 72, 15, 174, 209, 72, 137, 212, 72, 131, 228, 240, 72, 137, 248, 72, 137, 247, 49, 237, 255, 208, 49, 255, 184, 60, 0, 0, 0, 15, 5, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 204, 0, 0, 0, 0, 0, 0, 0, 0];
     variabile pagina_stub: *byte;
+    variabile tcb: *byte;
     rischio {
         pagina_stub = mmap((0 come dimensione) come *byte, 4096, 7, 34, -1, 0);
-        per i in 0..128 { *(pagina_stub + i) = codice[i]; }
+        per i in 0..264 { *(pagina_stub + i) = codice[i]; }
         stub = pagina_stub come naturale64;
+        tcb = mmap((0 come dimensione) come *byte, 4096, 3, 34, -1, 0);
     }
-    variabile leggi_fs: funzione() -> naturale64;
     variabile g: funzione(intero, *byte, *byte) = gestore;
-    rischio { leggi_fs = (pagina_stub + 16) come funzione() -> naturale64; }
-    costante fs_ospite: naturale64 = leggi_fs();
-    scrivi64(pagina_stub, 264, fs_ospite);                                   // host_fs
-    rischio { scrivi64(pagina_stub, 272, (g come *byte) come naturale64); }  // handler_c
-    scrivi64(pagina_stub, 256, fs_ospite);                                   // guest_fs: all'inizio uguale
+    rischio { scrivi64(pagina_stub, 256, (g come *byte) come naturale64); }          // handler_c
+    rischio { imposta_gs(tcb come naturale64); }
+    scrivi_blocco64(0, leggi_fs());
+    scrivi_blocco64(8, leggi_fs());
+    scrivi_blocco64(24, 1000);
     variabile ksa: [byte; 32];
     variabile errore_sa: lungo = 0;
     rischio {
         costante k: *byte = &ksa[0];
-        scrivi64(k, 0, ((pagina_stub + 32) come naturale64));               // il gestore e' il trampolino
+        scrivi64(k, 0, ((pagina_stub + 64) come naturale64));               // il gestore e' il trampolino
         scrivi64(k, 8, 4 | 67108864);                                        // SA_SIGINFO | SA_RESTORER
         scrivi64(k, 16, (pagina_stub come naturale64));                      // restorer
         scrivi64(k, 24, 0);
         errore_sa = syscall(13, 31, (k come naturale64) come lungo, 0, 8);   // rt_sigaction(SIGSYS)
         se errore_sa != 0 { ritorna falso; }
-        selettore[0] = 0;
-        se prctl(59, 1, pagina_stub come naturale64, 4096, (&selettore[0]) come naturale64) != 0 { ritorna falso; }
+        se prctl(59, 1, pagina_stub come naturale64, 4096, (tcb + 16) come naturale64) != 0 { ritorna falso; }
     }
     ritorna vero;
 }

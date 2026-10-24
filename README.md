@@ -9,6 +9,8 @@ Le fondamenta di un emulatore PS5/PS4 scritto in **Ce++** (https://github.com/Du
 - `src/sistema.ce`: intercetta le `syscall` del programma ospite con *syscall user dispatch* di Linux (kernel >= 5.11) e le serve in Ce++,
   con la convenzione FreeBSD di PS4/PS5 (numero in rax; argomenti in rdi, rsi, rdx, r10, r8, r9). Per ora: `exit`, `read`, `write`, `open` (flag tradotti), `close`, `getpid`, `mmap` (flag tradotti), `munmap`, `mprotect`, `lseek`,
   `clock_gettime`, `nanosleep`, `sysarch` (base di FS = TLS del guest), il resto da' ENOSYS. Gli errori seguono la convenzione BSD (CF=1, rax=errno).
+  Thread del guest: `thr_new` crea un thread vero con lo stack e il TLS scelti dal guest, `thr_exit`, `thr_self`, `_umtx_op` (WAIT/WAKE tradotti in futex di Linux), `sched_yield`.
+  Ogni thread ha un blocco di controllo (nel registro GS) con il proprio selettore e le due basi di FS.
   Un piccolo stub in linguaggio macchina scambia il registro FS fra guest e ospite a ogni syscall, cosi' il TLS del guest non rovina quello di libc.
 - `prog/`: programmi di prova scritti in assembly (sorgente `.asm` e `.elf` pronto).
 
@@ -20,7 +22,7 @@ Le fondamenta di un emulatore PS5/PS4 scritto in **Ce++** (https://github.com/Du
     python3 tests/prova.py
 
 ## Cosa NON c'e' (ancora)
-Formato SELF/PRX di Sony, moduli di sistema (libkernel ecc.), thread e TLS del guest, la GPU (traduzione dei comandi AMD e degli shader in Vulkan),
+Formato SELF/PRX di Sony, moduli di sistema (libkernel ecc.), la GPU (traduzione dei comandi AMD e degli shader in Vulkan),
 audio, input. E' una base, non un emulatore che esegue giochi.
 
 ## Legalita'

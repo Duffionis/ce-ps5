@@ -28,9 +28,9 @@ funzione principale() -> intero {
     se !c.riuscito { stampa("errore: ", c.errore); ritorna 2; }
     se testo_uguale(argomento(1), "ospite") {
         se !prepara() { stampa("errore: syscall user dispatch non disponibile in questo kernel"); ritorna 2; }
-        selettore[0] = 1;
+        selettore(1);
         costante r: intero = esegui_entrata(c.valore.entrata);
-        selettore[0] = 0;
+        selettore(0);
         ritorna r;
     }
     ritorna esegui_entrata(c.valore.entrata);
