@@ -1,0 +1,168 @@
+// Lettura e caricamento di eseguibili ELF64 x86-64 (la base di un emulatore che esegue il codice del gioco "nativamente").
+// Ogni lettura e' controllata: un file malformato da' un errore, mai un accesso fuori dai limiti.
+usa "@testo.ce";
+usa "@risultato.ce";
+
+esterna funzione mmap(a: *byte, lunghezza: dimensione, prot: intero, flag: intero, fd: intero, off: lungo) -> *byte;
+esterna funzione mprotect(a: *byte, lunghezza: dimensione, prot: intero) -> intero;
+esterna funzione memcpy(dst: *byte, src: *byte, n: dimensione) -> *byte;
+
+costante PT_LOAD: naturale32 = 1;
+costante PT_DYNAMIC: naturale32 = 2;
+costante ET_EXEC: naturale16 = 2;
+costante ET_DYN: naturale16 = 3;
+costante PAGINA: naturale64 = 4096;
+
+struttura Segmento {
+    tipo: naturale32,
+    flag: naturale32,
+    scarto: naturale64,
+    indirizzo: naturale64,
+    in_file: naturale64,
+    in_memoria: naturale64,
+}
+
+struttura Elf {
+    tipo: naturale16,
+    macchina: naturale16,
+    entrata: naturale64,
+    segmenti: naturale64,   // quanti
+    tabella: naturale64,    // dove
+    dim_voce: naturale64,
+}
+
+funzione leggi_n16(d: [byte], o: dimensione) -> naturale64 {
+    ritorna (d[o] come naturale64) | ((d[o + 1] come naturale64) << 8);
+}
+funzione leggi_n32(d: [byte], o: dimensione) -> naturale64 { ritorna leggi_n16(d, o) | (leggi_n16(d, o + 2) << 16); }
+funzione leggi_n64(d: [byte], o: dimensione) -> naturale64 { ritorna leggi_n32(d, o) | (leggi_n32(d, o + 4) << 32); }
+
+funzione analizza(d: [byte]) -> Risultato<Elf, testo> {
+    variabile e: Elf;
+    se d.lunghezza < 64 { ritorna male("file troppo corto per essere un ELF"); }
+    se d[0] != 127 || d[1] != 69 || d[2] != 76 || d[3] != 70 { ritorna male("non e' un ELF (manca la firma)"); }
+    se d[4] != 2 { ritorna male("non e' un ELF a 64 bit"); }
+    se d[5] != 1 { ritorna male("non e' little-endian"); }
+    e.tipo = leggi_n16(d, 16) come naturale16;
+    e.macchina = leggi_n16(d, 18) come naturale16;
+    se e.macchina != 62 { ritorna male("non e' x86-64"); }
+    se e.tipo != ET_EXEC && e.tipo != ET_DYN { ritorna male("tipo di ELF non gestito (serve eseguibile statico o PIE)"); }
+    e.entrata = leggi_n64(d, 24);
+    e.tabella = leggi_n64(d, 32);
+    e.dim_voce = leggi_n16(d, 54);
+    e.segmenti = leggi_n16(d, 56);
+    se e.dim_voce < 56 { ritorna male("voci della tabella dei segmenti troppo piccole"); }
+    se e.tabella > (d.lunghezza come naturale64) || e.segmenti * e.dim_voce > (d.lunghezza come naturale64) - e.tabella {
+        ritorna male("la tabella dei segmenti esce dal file");
+    }
+    ritorna bene(e);
+}
+
+funzione segmento(d: [byte], e: Elf, i: naturale64) -> Segmento {
+    costante o: dimensione = (e.tabella + i * e.dim_voce) come dimensione;
+    variabile s: Segmento;
+    s.tipo = leggi_n32(d, o) come naturale32;
+    s.flag = leggi_n32(d, o + 4) come naturale32;
+    s.scarto = leggi_n64(d, o + 8);
+    s.indirizzo = leggi_n64(d, o + 16);
+    s.in_file = leggi_n64(d, o + 32);
+    s.in_memoria = leggi_n64(d, o + 40);
+    ritorna s;
+}
+
+funzione giu(n: naturale64) -> naturale64 { ritorna n - (n % PAGINA); }
+funzione su(n: naturale64) -> naturale64 { ritorna giu(n + PAGINA - 1); }
+
+struttura Caricato {
+    base: naturale64,
+    entrata: naturale64,
+}
+
+// Mappa i segmenti in memoria, applica le rilocazioni, imposta i permessi.
+funzione carica(d: [byte], e: Elf) -> Risultato<Caricato, testo> {
+    variabile minimo: naturale64 = 18446744073709551615;
+    variabile massimo: naturale64 = 0;
+    per i in 0..e.segmenti {
+        costante s: Segmento = segmento(d, e, i come naturale64);
+        se s.tipo == PT_LOAD {
+            se s.in_file > s.in_memoria { ritorna male("segmento con filesz > memsz"); }
+            se s.scarto > (d.lunghezza come naturale64) || s.in_file > (d.lunghezza come naturale64) - s.scarto {
+                ritorna male("un segmento esce dal file");
+            }
+            se giu(s.indirizzo) < minimo { minimo = giu(s.indirizzo); }
+            se su(s.indirizzo + s.in_memoria) > massimo { massimo = su(s.indirizzo + s.in_memoria); }
+        }
+    }
+    se massimo <= minimo { ritorna male("nessun segmento da caricare"); }
+    variabile base: naturale64 = 0;
+    variabile p: *byte;
+    rischio {
+        se e.tipo == ET_EXEC {
+            p = mmap(minimo come *byte, (massimo - minimo) come dimensione, 3, 34 | 1048576, -1, 0);
+        } altrimenti {
+            p = mmap((0 come dimensione) come *byte, (massimo - minimo) come dimensione, 3, 34, -1, 0);
+        }
+        se (p come naturale64) == 18446744073709551615 { ritorna male("mmap fallita (indirizzo occupato?)"); }
+        se e.tipo == ET_EXEC { base = 0; } altrimenti { base = (p come naturale64) - minimo; }
+    }
+    // copia dei dati
+    per i in 0..e.segmenti {
+        costante s: Segmento = segmento(d, e, i come naturale64);
+        se s.tipo == PT_LOAD && s.in_file > 0 {
+            rischio { memcpy(((base + s.indirizzo) come *byte), &d[s.scarto come dimensione], s.in_file come dimensione); }
+        }
+    }
+    // rilocazioni (R_X86_64_RELATIVE) dal segmento dinamico
+    per i in 0..e.segmenti {
+        costante s: Segmento = segmento(d, e, i come naturale64);
+        se s.tipo == PT_DYNAMIC {
+            variabile rela: naturale64 = 0;
+            variabile dim: naturale64 = 0;
+            variabile k: naturale64 = 0;
+            mentre k + 16 <= s.in_file {
+                costante o: dimensione = (s.scarto + k) come dimensione;
+                costante tag: naturale64 = leggi_n64(d, o);
+                se tag == 0 { k = s.in_file; }
+                se tag == 7 { rela = leggi_n64(d, o + 8); }
+                se tag == 8 { dim = leggi_n64(d, o + 8); }
+                k += 16;
+            }
+            se dim > 0 {
+                variabile r: naturale64 = 0;
+                mentre r + 24 <= dim {
+                    // l'indirizzo virtuale della tabella va ritrovato nel file attraverso il segmento che lo contiene
+                    variabile letto: booleano = falso;
+                    per j in 0..e.segmenti {
+                        costante t: Segmento = segmento(d, e, j come naturale64);
+                        se t.tipo == PT_LOAD && rela >= t.indirizzo && rela + r + 24 <= t.indirizzo + t.in_file && !letto {
+                            costante o: dimensione = (t.scarto + (rela - t.indirizzo) + r) come dimensione;
+                            costante dove: naturale64 = leggi_n64(d, o);
+                            costante info: naturale64 = leggi_n64(d, o + 8);
+                            costante add: naturale64 = leggi_n64(d, o + 16);
+                            se (info & 4294967295) != 8 { ritorna male("rilocazione non gestita (solo RELATIVE)"); }
+                            rischio { *((base + dove) come *naturale64) = base + add; }
+                            letto = vero;
+                        }
+                    }
+                    se !letto { ritorna male("tabella delle rilocazioni fuori dai segmenti"); }
+                    r += 24;
+                }
+            }
+        }
+    }
+    // permessi finali: PF_X=1, PF_W=2, PF_R=4 -> PROT_R=1, PROT_W=2, PROT_X=4
+    per i in 0..e.segmenti {
+        costante s: Segmento = segmento(d, e, i come naturale64);
+        se s.tipo == PT_LOAD {
+            variabile prot: intero = 0;
+            se (s.flag & 4) != 0 { prot = prot | 1; }
+            se (s.flag & 2) != 0 { prot = prot | 2; }
+            se (s.flag & 1) != 0 { prot = prot | 4; }
+            rischio { mprotect((base + giu(s.indirizzo)) come *byte, (su(s.indirizzo + s.in_memoria) - giu(s.indirizzo)) come dimensione, prot); }
+        }
+    }
+    variabile c: Caricato;
+    c.base = base;
+    c.entrata = base + e.entrata;
+    ritorna bene(c);
+}

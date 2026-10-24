@@ -1,0 +1,37 @@
+usa "elf.ce";
+usa "sistema.ce";
+usa "@file.ce";
+
+funzione esegui_entrata(indirizzo: naturale64) -> intero {
+    variabile f: funzione() -> intero;
+    rischio { f = (indirizzo come *byte) come funzione() -> intero; }
+    ritorna f();
+}
+
+funzione principale() -> intero {
+    se numero_argomenti() < 3 { stampa("uso: ce-ps5 info|esegui|ospite file.elf"); ritorna 2; }
+    costante lett: Risultato<[byte], testo> = leggi_file(argomento(2));
+    se !lett.riuscito { stampa("errore: ", lett.errore); ritorna 2; }
+    costante d: [byte] = lett.valore;
+    costante a: Risultato<Elf, testo> = analizza(d);
+    se !a.riuscito { stampa("errore: ", a.errore); ritorna 2; }
+    costante e: Elf = a.valore;
+    se testo_uguale(argomento(1), "info") {
+        stampa("ELF64 x86-64, tipo ", e.tipo, " entrata ", e.entrata, " segmenti ", e.segmenti);
+        per i in 0..e.segmenti {
+            costante s: Segmento = segmento(d, e, i come naturale64);
+            stampa("  tipo ", s.tipo, " flag ", s.flag, " indirizzo ", s.indirizzo, " file ", s.in_file, " memoria ", s.in_memoria);
+        }
+        ritorna 0;
+    }
+    costante c: Risultato<Caricato, testo> = carica(d, e);
+    se !c.riuscito { stampa("errore: ", c.errore); ritorna 2; }
+    se testo_uguale(argomento(1), "ospite") {
+        se !prepara() { stampa("errore: syscall user dispatch non disponibile in questo kernel"); ritorna 2; }
+        selettore[0] = 1;
+        costante r: intero = esegui_entrata(c.valore.entrata);
+        selettore[0] = 0;
+        ritorna r;
+    }
+    ritorna esegui_entrata(c.valore.entrata);
+}
