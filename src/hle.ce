@@ -1,0 +1,40 @@
+// Le funzioni "di sistema" che i programmi guest possono importare per nome (un mini libkernel scritto da noi).
+// Ogni funzione e' una normale funzione Ce++ con argomenti interi: il ponte (sistema.ce) la rende chiamabile dal guest.
+usa "sistema.ce";
+
+esterna funzione fflush(f: *byte) -> intero;
+
+funzione ce_scrivi(testo_guest: naturale64, lunghezza: naturale64) -> naturale64 {
+    variabile fatti: lungo = 0;
+    rischio { fatti = write(1, testo_guest come *byte, lunghezza come dimensione); }
+    ritorna fatti come naturale64;
+}
+
+funzione ce_numero(n: naturale64, ignorato: naturale64) -> naturale64 {
+    stampa(n);
+    ritorna 0;
+}
+
+funzione ce_uscita(codice: naturale64, ignorato: naturale64) -> naturale64 {
+    rischio { fflush(nullo); _exit(codice come intero); }
+    ritorna 0;
+}
+
+// il nome del simbolo e' una stringa C in memoria
+funzione nome_uguale(a: naturale64, t: testo) -> booleano {
+    per i in 0..t.lunghezza {
+        se mem8(a + (i come naturale64)) != (t[i] come naturale64) { ritorna falso; }
+    }
+    ritorna mem8(a + (t.lunghezza come naturale64)) == 0;
+}
+
+funzione mem8(a: naturale64) -> naturale64 { rischio { ritorna (*(a come *byte)) come naturale64; } }
+
+funzione risolvi_simbolo(nome: naturale64) -> naturale64 {
+    variabile f: funzione(naturale64, naturale64) -> naturale64;
+    se nome_uguale(nome, "ce_scrivi") { f = ce_scrivi; }
+    altrimenti se nome_uguale(nome, "ce_numero") { f = ce_numero; }
+    altrimenti se nome_uguale(nome, "ce_uscita") { f = ce_uscita; }
+    altrimenti { ritorna 0; }
+    rischio { ritorna ponte((f come *byte) come naturale64); }
+}

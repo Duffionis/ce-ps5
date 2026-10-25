@@ -1,5 +1,5 @@
 usa "elf.ce";
-usa "sistema.ce";
+usa "hle.ce";
 usa "@file.ce";
 
 funzione esegui_entrata(indirizzo: naturale64) -> intero {
@@ -7,6 +7,8 @@ funzione esegui_entrata(indirizzo: naturale64) -> intero {
     rischio { f = (indirizzo come *byte) come funzione() -> intero; }
     ritorna f();
 }
+
+funzione nessun_simbolo(nome: naturale64) -> naturale64 { ritorna 0; }
 
 funzione principale() -> intero {
     se numero_argomenti() < 3 { stampa("uso: ce-ps5 info|esegui|ospite file.elf"); ritorna 2; }
@@ -24,14 +26,16 @@ funzione principale() -> intero {
         }
         ritorna 0;
     }
-    costante c: Risultato<Caricato, testo> = carica(d, e);
-    se !c.riuscito { stampa("errore: ", c.errore); ritorna 2; }
     se testo_uguale(argomento(1), "ospite") {
         se !prepara() { stampa("errore: syscall user dispatch non disponibile in questo kernel"); ritorna 2; }
+        costante c: Risultato<Caricato, testo> = carica(d, e, risolvi_simbolo);
+        se !c.riuscito { stampa("errore: ", c.errore); ritorna 2; }
         selettore(1);
         costante r: intero = esegui_entrata(c.valore.entrata);
         selettore(0);
         ritorna r;
     }
+    costante c: Risultato<Caricato, testo> = carica(d, e, nessun_simbolo);
+    se !c.riuscito { stampa("errore: ", c.errore); ritorna 2; }
     ritorna esegui_entrata(c.valore.entrata);
 }

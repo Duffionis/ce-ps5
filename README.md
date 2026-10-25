@@ -12,6 +12,9 @@ Le fondamenta di un emulatore PS5/PS4 scritto in **Ce++** (https://github.com/Du
   Thread del guest: `thr_new` crea un thread vero con lo stack e il TLS scelti dal guest, `thr_exit`, `thr_self`, `_umtx_op` (WAIT/WAKE tradotti in futex di Linux), `sched_yield`.
   Ogni thread ha un blocco di controllo (nel registro GS) con il proprio selettore e le due basi di FS.
   Un piccolo stub in linguaggio macchina scambia il registro FS fra guest e ospite a ogni syscall, cosi' il TLS del guest non rovina quello di libc.
+- `src/hle.ce` + il ponte in `sistema.ce`: il guest puo' *importare funzioni per nome* (rilocazioni GLOB_DAT/JUMP_SLOT/64): le risolviamo
+  verso funzioni Ce++ nostre (per ora `ce_scrivi`, `ce_numero`, `ce_uscita`: un mini libkernel). Un "ponte" in linguaggio macchina cambia FS e il selettore
+  prima di chiamare l'ospite e li rimette dopo. Questo e' il meccanismo con cui un programma PS5 chiamerebbe la libreria di sistema.
 - `prog/`: programmi di prova scritti in assembly (sorgente `.asm` e `.elf` pronto).
 
 ## Uso
@@ -22,7 +25,7 @@ Le fondamenta di un emulatore PS5/PS4 scritto in **Ce++** (https://github.com/Du
     python3 tests/prova.py
 
 ## Cosa NON c'e' (ancora)
-Formato SELF/PRX di Sony, moduli di sistema (libkernel ecc.), la GPU (traduzione dei comandi AMD e degli shader in Vulkan),
+Formato SELF/PRX di Sony, i nomi hash (NID) delle funzioni di Sony, un libkernel/libc vero, la GPU (traduzione dei comandi AMD e degli shader in Vulkan),
 audio, input. E' una base, non un emulatore che esegue giochi.
 
 ## Legalita'

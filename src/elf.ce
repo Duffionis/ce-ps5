@@ -79,7 +79,14 @@ struttura Caricato {
 }
 
 // Mappa i segmenti in memoria, applica le rilocazioni, imposta i permessi.
-funzione carica(d: [byte], e: Elf) -> Risultato<Caricato, testo> {
+// Accesso alla memoria caricata (indirizzi grezzi: solo qui, solo per il loader)
+funzione mem64(a: naturale64) -> naturale64 { rischio { ritorna *(a come *naturale64); } }
+funzione mem32(a: naturale64) -> naturale64 { rischio { ritorna (*(a come *naturale32)) come naturale64; } }
+funzione mem16(a: naturale64) -> naturale64 { rischio { ritorna (*(a come *naturale16)) come naturale64; } }
+funzione scrivi_mem64(a: naturale64, v: naturale64) { rischio { *(a come *naturale64) = v; } }
+
+// 'risolvi' riceve l'indirizzo del nome (stringa C) di un simbolo importato e ritorna l'indirizzo della funzione, o 0.
+funzione carica(d: [byte], e: Elf, risolvi: funzione(naturale64) -> naturale64) -> Risultato<Caricato, testo> {
     variabile minimo: naturale64 = 18446744073709551615;
     variabile massimo: naturale64 = 0;
     per i in 0..e.segmenti {
@@ -112,39 +119,57 @@ funzione carica(d: [byte], e: Elf) -> Risultato<Caricato, testo> {
             rischio { memcpy(((base + s.indirizzo) come *byte), &d[s.scarto come dimensione], s.in_file come dimensione); }
         }
     }
-    // rilocazioni (R_X86_64_RELATIVE) dal segmento dinamico
+    // rilocazioni: RELATIVE, e i simboli importati/esportati (64, GLOB_DAT, JUMP_SLOT), leggendo dalla memoria appena caricata
     per i in 0..e.segmenti {
         costante s: Segmento = segmento(d, e, i come naturale64);
         se s.tipo == PT_DYNAMIC {
             variabile rela: naturale64 = 0;
             variabile dim: naturale64 = 0;
+            variabile plt: naturale64 = 0;
+            variabile dim_plt: naturale64 = 0;
+            variabile simboli: naturale64 = 0;
+            variabile nomi: naturale64 = 0;
             variabile k: naturale64 = 0;
             mentre k + 16 <= s.in_file {
                 costante o: dimensione = (s.scarto + k) come dimensione;
                 costante tag: naturale64 = leggi_n64(d, o);
+                costante val: naturale64 = leggi_n64(d, o + 8);
                 se tag == 0 { k = s.in_file; }
-                se tag == 7 { rela = leggi_n64(d, o + 8); }
-                se tag == 8 { dim = leggi_n64(d, o + 8); }
+                se tag == 2 { dim_plt = val; }
+                se tag == 5 { nomi = val; }
+                se tag == 6 { simboli = val; }
+                se tag == 7 { rela = val; }
+                se tag == 8 { dim = val; }
+                se tag == 23 { plt = val; }
                 k += 16;
             }
-            se dim > 0 {
+            variabile tabelle: [naturale64; 4] = [rela, dim, plt, dim_plt];
+            per t in 0..2 {
+                costante inizio: naturale64 = tabelle[t * 2];
+                costante lungh: naturale64 = tabelle[t * 2 + 1];
                 variabile r: naturale64 = 0;
-                mentre r + 24 <= dim {
-                    // l'indirizzo virtuale della tabella va ritrovato nel file attraverso il segmento che lo contiene
-                    variabile letto: booleano = falso;
-                    per j in 0..e.segmenti {
-                        costante t: Segmento = segmento(d, e, j come naturale64);
-                        se t.tipo == PT_LOAD && rela >= t.indirizzo && rela + r + 24 <= t.indirizzo + t.in_file && !letto {
-                            costante o: dimensione = (t.scarto + (rela - t.indirizzo) + r) come dimensione;
-                            costante dove: naturale64 = leggi_n64(d, o);
-                            costante info: naturale64 = leggi_n64(d, o + 8);
-                            costante add: naturale64 = leggi_n64(d, o + 16);
-                            se (info & 4294967295) != 8 { ritorna male("rilocazione non gestita (solo RELATIVE)"); }
-                            rischio { *((base + dove) come *naturale64) = base + add; }
-                            letto = vero;
+                mentre inizio != 0 && r + 24 <= lungh {
+                    costante dove: naturale64 = mem64(base + inizio + r);
+                    costante info: naturale64 = mem64(base + inizio + r + 8);
+                    costante add: naturale64 = mem64(base + inizio + r + 16);
+                    costante tipo: naturale64 = info & 4294967295;
+                    costante sim: naturale64 = info >> 32;
+                    se tipo == 8 {
+                        scrivi_mem64(base + dove, base + add);
+                    } altrimenti se tipo == 1 || tipo == 6 || tipo == 7 {
+                        se simboli == 0 { ritorna male("rilocazione con simbolo ma senza tabella dei simboli"); }
+                        costante voce: naturale64 = base + simboli + sim * 24;
+                        costante nome: naturale64 = base + nomi + mem32(voce);
+                        costante definito: naturale64 = mem16(voce + 6);
+                        variabile valore: naturale64 = 0;
+                        se definito != 0 {
+                            valore = base + mem64(voce + 8);
+                        } altrimenti {
+                            valore = risolvi(nome);
+                            se valore == 0 { ritorna male("simbolo importato sconosciuto"); }
                         }
-                    }
-                    se !letto { ritorna male("tabella delle rilocazioni fuori dai segmenti"); }
+                        se tipo == 1 { scrivi_mem64(base + dove, valore + add); } altrimenti { scrivi_mem64(base + dove, valore); }
+                    } altrimenti { ritorna male("tipo di rilocazione non gestito"); }
                     r += 24;
                 }
             }
